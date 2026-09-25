@@ -1,0 +1,6 @@
+shazamio>=0.7.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+requests>=2.31.0
+numpy>=1.24.0
+Pillow>=10.0.0
