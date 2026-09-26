@@ -5,18 +5,23 @@ Grafische Oberfläche für Live-Lyrics im Stil von Apple Music.
 
 - Startet die Mikrofon-Aufnahme automatisch beim Öffnen des Fensters.
 - Beendet wird nur durch Schließen des Fensters (kein Button nötig).
-- Alle paar Sekunden wird automatisch neu erkannt und die Sync-Position
-  selbstständig nachjustiert (self-healing Sync), ohne Hinweistext.
+- Erkennt automatisch den nächsten Song, sobald der aktuelle zu Ende geht
+  (schnelleres Polling gegen Songende).
+- Die ersten 30 Sekunden eines Songs wird die Sync-Position laufend fein
+  nachjustiert; danach wird sie "eingefroren", damit z.B. Tastatur- oder
+  Umgebungsgeräusche die laufende Synchronität nicht mehr durcheinander
+  bringen. Ein Songwechsel wird davon unabhängig weiterhin sofort erkannt.
+- Zeilenübergänge sind zeitbasiert animiert und blenden an beiden Rändern
+    weich aus.
+- Inaktive Zeilen werden mit versetzten Textlagen weichgezeichnet.
 - Der gesamte Hintergrund ist eine weichgezeichnete, abgedunkelte Version
-  des Album-Covers; Titel und Lyrics liegen lesbar darüber.
-- Lyrics-Zeilen werden über wiederverwendete Canvas-Elemente sanft animiert
-  (kein Neuaufbau pro Frame -> flüssige Bewegung). Nur die aktuelle Zeile
-  ist weiß & groß, alle anderen einheitlich grau.
+  des Album-Covers.
 
 Nutzt die Erkennungs- und Lyrics-Logik aus lyrics_live.py (muss im selben
 Ordner liegen).
 
-Feinjustierung der Sync per Tastatur weiterhin möglich: '+' schneller, '-' langsamer.
+Feinjustierung der Sync per Tastatur weiterhin möglich (nur in den ersten
+30s wirksam, danach eingefroren): '+' schneller, '-' langsamer.
 """
 
 import asyncio
@@ -35,48 +40,51 @@ from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageTk
 
 from lyrics_live import get_lrc_lyrics, parse_lrc, recognize, save_wav
 
-WINDOW_W, WINDOW_H = 520, 860
+WINDOW_W, WINDOW_H = 520, 880
 BG_FALLBACK = "#0b0b0d"
+BG_APPROX = (18, 14, 16)  # grobe Näherung an den abgedunkelten Hintergrund
 
 FG_ACTIVE = (255, 255, 255)
 FG_DIM = (150, 150, 155)
 
-CONTEXT_LINES = 3
+CONTEXT_LINES = 2
 NUM_SLOTS = 2 * CONTEXT_LINES + 3
 SNIPPET_SECONDS = 8
-RESYNC_INTERVAL = 15
+RESYNC_INTERVAL = 15      # normales Abstand zwischen Erkennungen
+FAST_INTERVAL = 4         # kurz vor/nach Songende: öfter prüfen
+END_APPROACH_SECONDS = 20 # ab wann "kurz vor Songende" gilt
+SYNC_LOCK_SECONDS = 30    # danach wird die Sync-Position eingefroren
 NUDGE_STEP = 0.3
 
-LEFT_MARGIN = 34
-TEXT_WIDTH = WINDOW_W - 2 * LEFT_MARGIN
+ACTIVE_SIZE = 23
+FAR_SIZE = 16
+LINE_GAP = 42
+ACTIVE_EXTRA_GAP = 26
+ANIM_DURATION = 0.35      # Sekunden pro Zeilenwechsel-Animation
+FRAME_MS = 16             # ~60 fps
 
-LINE_GAP = 40       # Grundabstand zwischen (nicht-aktiven) Zeilen
-ACTIVE_EXTRA_GAP = 26  # zusätzlicher Puffer direkt um die aktive Zeile
-ACTIVE_SIZE = 21
-FAR_SIZE = 15
-EASE = 0.12          # kleiner = sanfteres, langsameres Gleiten
-FRAME_MS = 16        # ~60 fps
+COVER_SIZE = 230
+TOP_PAD = 50
+COVER_Y = TOP_PAD + COVER_SIZE // 2
+TITLE_Y = COVER_Y + COVER_SIZE // 2 + 34
+ARTIST_Y = TITLE_Y + 30
+STATUS_Y = ARTIST_Y + 26
 
-COVER_SIZE = 150
-COVER_Y = 130
-TITLE_Y = 244
-ARTIST_Y = 274
-STATUS_Y = 300
-
-LYRICS_TOP = 350       # oberhalb davon wird nichts gerendert (Schutzzone zum Header)
+LYRICS_TOP = STATUS_Y + 55
 LYRICS_BOTTOM = WINDOW_H - 40
 LYRICS_CENTER_Y = (LYRICS_TOP + LYRICS_BOTTOM) // 2
+FADE_ZONE = 70            # früheres Ein- und Ausblenden an beiden Lyrics-Rändern
+
+BLUR_OFFSETS = ((-1.3, -1.3), (1.3, -1.3), (-1.3, 1.3), (1.3, 1.3))
+BLUR_BLEND = 0.58         # wie stark die weichen Textlagen Richtung Hintergrund gehen
 
 BG_BLUR_RADIUS = 45
-BG_DARKEN = 0.5  # 0 = nur Bild, 1 = komplett schwarz
+BG_DARKEN = 0.5
 
 
 def line_offset(relative: float) -> float:
-    """Vertikaler Versatz einer Zeile relativ zur aktiven Zeile.
-
-    Direkt neben der aktiven Zeile wird extra Platz eingeräumt, damit die
-    größere/fette Schrift der aktiven Zeile nicht mit den Nachbarn kollidiert.
-    """
+    """Vertikaler Versatz einer Zeile relativ zur aktiven Zeile, mit Extra-
+    Puffer direkt neben der aktiven (größeren) Zeile."""
     if relative == 0:
         return 0.0
     sign = 1.0 if relative > 0 else -1.0
@@ -101,12 +109,13 @@ def make_background(img: Image.Image) -> Image.Image:
     return Image.blend(bg, dark, BG_DARKEN)
 
 
-def lerp_color(c1, c2, t):
+def lerp_rgb(c1, c2, t):
     t = max(0.0, min(1.0, t))
-    r = round(c1[0] + (c2[0] - c1[0]) * t)
-    g = round(c1[1] + (c2[1] - c1[1]) * t)
-    b = round(c1[2] + (c2[2] - c1[2]) * t)
-    return f"#{r:02x}{g:02x}{b:02x}"
+    return tuple(round(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+
+
+def rgb_hex(c):
+    return f"#{c[0]:02x}{c[1]:02x}{c[2]:02x}"
 
 
 class ContinuousRecorder:
@@ -180,11 +189,15 @@ class LyricsApp(tk.Tk):
         self.manual_adjust = 0.0
         self.target_index = 0
         self.scroll_pos = 0.0
+        self.anim_start_time = None
+        self.anim_start_value = 0.0
+        self.anim_target = 0
         self.ticking = False
         self.live = False
         self.recorder = None
         self._img_refs = []
         self._font_cache = {}
+        self._rendered_state = {}
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -213,7 +226,6 @@ class LyricsApp(tk.Tk):
                                  bg=BG_FALLBACK, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
 
-        # Hintergrund-Platzhalter (wird nach Erkennung durch echtes Bild ersetzt)
         self.bg_id = self.canvas.create_rectangle(0, 0, WINDOW_W, WINDOW_H,
                                                     fill=BG_FALLBACK, outline="")
 
@@ -221,25 +233,33 @@ class LyricsApp(tk.Tk):
 
         self.title_id = self.canvas.create_text(
             WINDOW_W // 2, TITLE_Y, text="", fill="#ffffff",
-            font=self._font(16, "bold"), width=WINDOW_W - 80, justify="center",
+            font=self._font(17, "bold"), width=WINDOW_W - 80, justify="center",
         )
         self.artist_id = self.canvas.create_text(
             WINDOW_W // 2, ARTIST_Y, text="", fill="#c7c7ca",
-            font=self._font(12, "normal"), width=WINDOW_W - 80, justify="center",
+            font=self._font(13, "normal"), width=WINDOW_W - 80, justify="center",
         )
         self.status_id = self.canvas.create_text(
             WINDOW_W // 2, STATUS_Y, text="🎙️ Höre zu …", fill="#c7c7ca",
             font=self._font(12, "normal"), width=WINDOW_W - 80, justify="center",
         )
 
-        # Feste Anzahl wiederverwendbarer Text-Slots für die Lyrics (kein
-        # Neuaufbau pro Frame -> flüssige Animation). Linksbündig wie im
-        # Referenzdesign.
+        # Versetzte Textlagen erzeugen für inaktive Zeilen einen weichen Blur.
+        self.blur_ids = []
         self.slot_ids = []
         for _ in range(NUM_SLOTS):
+            layers = []
+            for dx, dy in BLUR_OFFSETS:
+                layers.append(self.canvas.create_text(
+                    WINDOW_W // 2 + dx, -200 + dy, text="",
+                    fill="#000000", font=self._font(FAR_SIZE, "bold"),
+                    width=WINDOW_W - 64, justify="center",
+                ))
+            self.blur_ids.append(layers)
+        for _ in range(NUM_SLOTS):
             sid = self.canvas.create_text(
-                LEFT_MARGIN, -200, text="", fill="#000000", anchor="w",
-                font=self._font(FAR_SIZE, "normal"), width=TEXT_WIDTH, justify="left",
+                WINDOW_W // 2, -200, text="", fill="#000000",
+                font=self._font(FAR_SIZE, "bold"), width=WINDOW_W - 64, justify="center",
             )
             self.slot_ids.append(sid)
 
@@ -262,6 +282,18 @@ class LyricsApp(tk.Tk):
         self._stop_live()
         self.destroy()
 
+    def _next_interval(self):
+        """Kurz vor (oder nach) Songende öfter prüfen, damit der nächste
+        Song schnell erkannt wird."""
+        if not self.lines or self.start_time is None:
+            return FAST_INTERVAL
+        last_ts = self.lines[-1][0]
+        now = time.time() - self.start_time
+        remaining = last_ts - now
+        if remaining < END_APPROACH_SECONDS:
+            return FAST_INTERVAL
+        return RESYNC_INTERVAL
+
     def _live_loop(self):
         recorder = self.recorder
         while self.live and recorder.available_seconds() < SNIPPET_SECONDS:
@@ -270,8 +302,9 @@ class LyricsApp(tk.Tk):
         while self.live:
             data, start_walltime = recorder.snapshot(SNIPPET_SECONDS)
             self._process_snapshot(data, start_walltime)
+            interval = self._next_interval()
             waited = 0.0
-            while self.live and waited < RESYNC_INTERVAL:
+            while self.live and waited < interval:
                 time.sleep(0.5)
                 waited += 0.5
 
@@ -318,6 +351,13 @@ class LyricsApp(tk.Tk):
                 self._set_status("⚠️ Keine zeitsynchronen Lyrics gefunden.")
                 self.after(0, self._hide_lyrics)
                 return
+        else:
+            # Gleicher Song: nach Ablauf des Sync-Fensters keine weiteren
+            # Zeit-Korrekturen mehr vornehmen (robust gegen Störgeräusche).
+            if self.start_time is not None:
+                elapsed = time.time() - self.start_time
+                if elapsed > SYNC_LOCK_SECONDS:
+                    return
 
         if offset is not None and self.lines:
             self.start_time = start_walltime - offset + self.manual_adjust
@@ -332,20 +372,22 @@ class LyricsApp(tk.Tk):
                         break
                 self.target_index = idx
                 self.scroll_pos = float(idx)
+                self.anim_start_time = None
                 self._set_status("")
 
             if not self.ticking:
                 self.ticking = True
-                self.after(0, self._check_index)
                 self.after(0, self._animate)
-            # Stiller Resync bei gleichem Song: keine Statusmeldung.
 
     def _set_status(self, text):
         self.after(0, lambda: self.canvas.itemconfigure(self.status_id, text=text))
 
     def _hide_lyrics(self):
         for sid in self.slot_ids:
-            self.canvas.itemconfigure(sid, text="")
+            self._set_text_item(sid, "", "", None)
+        for layers in self.blur_ids:
+            for item_id in layers:
+                self._set_text_item(item_id, "", "", None)
 
     def _set_song_info(self, title, artist, cover_url):
         def apply_text():
@@ -360,24 +402,23 @@ class LyricsApp(tk.Tk):
             base_img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
 
             bg_img = make_background(base_img)
-            cover_img = rounded_image(base_img.resize((COVER_SIZE, COVER_SIZE)), radius=20)
+            cover_img = rounded_image(base_img.resize((COVER_SIZE, COVER_SIZE)), radius=24)
 
             bg_photo = ImageTk.PhotoImage(bg_img)
             cover_photo = ImageTk.PhotoImage(cover_img)
 
             def apply_images():
-                # Hintergrund ersetzen: Rechteck-Platzhalter durch Bild ersetzen
                 self.canvas.delete(self.bg_id)
                 self.bg_id = self.canvas.create_image(0, 0, anchor="nw", image=bg_photo)
-                self.canvas.tag_lower(self.bg_id)  # ganz nach hinten
+                self.canvas.tag_lower(self.bg_id)
                 self.canvas.itemconfigure(self.cover_id, image=cover_photo)
-                self._img_refs = [bg_photo, cover_photo]  # Referenzen behalten
+                self._img_refs = [bg_photo, cover_photo]
 
             self.after(0, apply_images)
         except Exception:
             pass
 
-    # ---------- Lyrics-Sync & sanfte Animation ----------
+    # ---------- Lyrics-Sync & sanfte, zeitbasierte Animation ----------
 
     def _nudge(self, delta):
         self.manual_adjust += delta
@@ -394,49 +435,98 @@ class LyricsApp(tk.Tk):
                 idx = i
             else:
                 break
-        self.target_index = idx
-        self.after(80, self._check_index)
+
+        if idx != self.target_index:
+            self.anim_start_time = time.perf_counter()
+            self.anim_start_value = self.scroll_pos
+            self.anim_target = idx
+            self.target_index = idx
 
     def _animate(self):
         if not self.ticking:
             return
-        diff = self.target_index - self.scroll_pos
-        if abs(diff) > 0.005:
-            self.scroll_pos += diff * EASE
-        else:
+
+        self._check_index()
+        if self.anim_start_time is None:
             self.scroll_pos = float(self.target_index)
+        else:
+            elapsed = time.perf_counter() - self.anim_start_time
+            t = min(elapsed / ANIM_DURATION, 1.0)
+            eased = 1 - (1 - t) ** 3  # ease-out cubic: sanfter Auslauf
+            self.scroll_pos = self.anim_start_value + (self.anim_target - self.anim_start_value) * eased
+            if t >= 1.0:
+                self.anim_start_time = None
+                self.scroll_pos = float(self.anim_target)
+
         self._render_frame(self.scroll_pos)
         self.after(FRAME_MS, self._animate)
 
     def _render_frame(self, scroll_pos):
+        center_x = WINDOW_W // 2
         base = math.floor(scroll_pos)
         half = NUM_SLOTS // 2
 
-        for k, sid in enumerate(self.slot_ids):
+        for k in range(NUM_SLOTS):
+            sid = self.slot_ids[k]
+            layers = self.blur_ids[k]
             line_i = base - half + k
+
             if line_i < 0 or line_i >= len(self.lines):
-                self.canvas.itemconfigure(sid, text="")
+                self._set_text_item(sid, "", "", None)
+                for item_id in layers:
+                    self._set_text_item(item_id, "", "", None)
                 continue
 
             _, text = self.lines[line_i]
             relative = line_i - scroll_pos
             y = LYRICS_CENTER_Y + line_offset(relative)
 
-            # Außerhalb des sichtbaren Lyrics-Bereichs (Schutzzone zum Header
-            # bzw. unterer Rand) ausblenden, statt zu überlappen.
-            if not text or y < LYRICS_TOP or y > LYRICS_BOTTOM:
-                self.canvas.itemconfigure(sid, text="")
-                self.canvas.coords(sid, LEFT_MARGIN, y)
+            if not text or y < LYRICS_TOP - FADE_ZONE or y > LYRICS_BOTTOM + FADE_ZONE:
+                self._set_text_item(sid, "", "", None)
+                for item_id in layers:
+                    self._set_text_item(item_id, "", "", None)
+                self.canvas.coords(sid, center_x, y)
                 continue
 
             dist = abs(relative)
-            t = min(dist, 1.0)  # ab 1 Zeile Abstand einheitlich grau
+            t = min(dist, 1.0)
             size = round(ACTIVE_SIZE - (ACTIVE_SIZE - FAR_SIZE) * t)
-            color = lerp_color(FG_ACTIVE, FG_DIM, t)
-            weight = "bold" if dist < 0.5 else "normal"
+            base_color = lerp_rgb(FG_ACTIVE, FG_DIM, t)
 
-            self.canvas.coords(sid, LEFT_MARGIN, y)
-            self.canvas.itemconfigure(sid, text=text, fill=color, font=self._font(size, weight))
+            # Lyrics an beiden Kanten weich ein- und ausblenden.
+            if y < LYRICS_TOP + FADE_ZONE:
+                fade = max(0.0, min(1.0, (y - (LYRICS_TOP - FADE_ZONE)) / (FADE_ZONE * 2)))
+                base_color = lerp_rgb(BG_APPROX, base_color, fade)
+            elif y > LYRICS_BOTTOM - FADE_ZONE:
+                fade = max(0.0, min(1.0, (LYRICS_BOTTOM + FADE_ZONE - y) / (FADE_ZONE * 2)))
+                base_color = lerp_rgb(BG_APPROX, base_color, fade)
+
+            color = rgb_hex(base_color)
+            f = self._font(size, "bold")
+
+            self.canvas.coords(sid, center_x, y)
+            if dist <= 0.35:
+                self._set_text_item(sid, text, color, f)
+            else:
+                self._set_text_item(sid, "", "", None)
+
+            if dist > 0.35:
+                blur_color = rgb_hex(lerp_rgb(base_color, BG_APPROX, BLUR_BLEND))
+                for item_id, (dx, dy) in zip(layers, BLUR_OFFSETS):
+                    self.canvas.coords(item_id, center_x + dx, y + dy)
+                    self._set_text_item(item_id, text, blur_color, f)
+            else:
+                for item_id in layers:
+                    self._set_text_item(item_id, "", "", None)
+
+    def _set_text_item(self, item_id, text, color, font):
+        state = (text, color, font)
+        if self._rendered_state.get(item_id) != state:
+            if text:
+                self.canvas.itemconfigure(item_id, text=text, fill=color, font=font)
+            else:
+                self.canvas.itemconfigure(item_id, text="")
+            self._rendered_state[item_id] = state
 
 
 if __name__ == "__main__":
